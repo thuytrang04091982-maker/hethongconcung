@@ -23,15 +23,12 @@ const App: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [user, setUser] = useState<User>(CURRENT_USER);
-  const [isWaitingApproval, setIsWaitingApproval] = useState(false);
-  const [pendingRequests, setPendingRequests] = useState<any[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   
   const [newGroupName, setNewGroupName] = useState('');
   const [newGroupDesc, setNewGroupDesc] = useState('');
-  const [newGroupAvatar, setNewGroupAvatar] = useState<string | null>(null);
 
-  // 1. Khởi tạo & Tải danh sách nhóm
+  // 1. Khởi tạo ứng dụng & Tải danh sách nhóm
   useEffect(() => {
     setUser(getSessionUser());
     fetchGroups();
@@ -41,7 +38,6 @@ const App: React.FC = () => {
     try {
       const { data, error } = await supabase.from('groups').select('*').order('created_at', { ascending: false });
       if (!error && data) {
-        // Fix: Map Supabase snake_case fields to camelCase for GroupDetails interface
         setGroups(data.map((g: any) => ({
           ...g,
           adminId: g.admin_id,
@@ -49,30 +45,15 @@ const App: React.FC = () => {
         })));
       }
     } catch (e) {
-      console.error("Supabase connection error:", e);
+      console.error("Lỗi kết nối Supabase:", e);
     }
   };
 
-  // Tải danh sách yêu cầu chờ duyệt (chỉ dành cho Admin)
-  const fetchPendingRequests = async (groupId: string) => {
-    const { data, error } = await supabase
-      .from('member_requests')
-      .select('*')
-      .eq('group_id', groupId)
-      .eq('status', 'pending');
-    if (!error && data) setPendingRequests(data);
-  };
-
-  useEffect(() => {
-    if (screen === AppScreen.INFO && activeGroupId && (user.isAdmin || groups.find(g => g.id === activeGroupId)?.adminId === user.id)) {
-      fetchPendingRequests(activeGroupId);
-    }
-  }, [screen, activeGroupId, groups]);
-
-  // 2. Realtime & Tải tin nhắn khi vào nhóm
+  // 2. Cơ chế Realtime cực nhạy & Tải tin nhắn
   useEffect(() => {
     if (!activeGroupId) return;
 
+    // Tải lịch sử tin nhắn
     const fetchMessages = async () => {
       const { data } = await supabase
         .from('messages')
@@ -82,9 +63,12 @@ const App: React.FC = () => {
       
       if (data) {
         setMessages(data.map(m => ({
-          ...m,
+          id: m.id,
           sender: { id: m.sender_id, name: m.sender_name, avatar: m.sender_avatar },
+          text: m.text,
+          images: m.images,
           isMe: m.sender_id === user.id,
+          type: m.type || 'chat',
           timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         })));
       }
@@ -92,93 +76,126 @@ const App: React.FC = () => {
 
     fetchMessages();
 
-    const channel = supabase.channel(`group-${activeGroupId}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `group_id=eq.${activeGroupId}` }, payload => {
-        const m = payload.new;
-        setMessages(prev => {
-          if (prev.find(msg => msg.id === m.id)) return prev;
-          return [...prev, {
-            ...m,
-            sender: { id: m.sender_id, name: m.sender_name, avatar: m.sender_avatar },
-            isMe: m.sender_id === user.id,
-            timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          } as any];
-        });
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'member_requests', filter: `group_id=eq.${activeGroupId}` }, () => {
+    // Lắng nghe thay đổi DB thời gian thực (Realtime)
+    const channel = supabase.channel(`chat-room-${activeGroupId}`)
+      .on('postgres_changes', 
+        { 
+          event: 'INSERT', 
+          schema: 'public', 
+          table: 'messages', 
+          filter: `group_id=eq.${activeGroupId}` 
+        }, 
+        (payload) => {
+          const m = payload.new;
+          setMessages(prev => {
+            // Kiểm tra tránh trùng lặp nếu tin nhắn đã được thêm bởi Optimistic UI
+            if (prev.some(msg => msg.id === m.id)) return prev;
+            
+            return [...prev, {
+              id: m.id,
+              sender: { id: m.sender_id, name: m.sender_name, avatar: m.sender_avatar },
+              text: m.text,
+              images: m.images,
+              isMe: m.sender_id === user.id,
+              type: m.type || 'chat',
+              timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            }];
+          });
+        }
+      )
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'groups', filter: `id=eq.${activeGroupId}` }, () => {
         fetchGroups();
-        if (activeGroupId) fetchPendingRequests(activeGroupId);
       })
       .subscribe();
 
-    return () => { supabase.removeChannel(channel); };
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [activeGroupId, user.id]);
 
+  // Tự động cuộn xuống khi có tin nhắn mới
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (scrollRef.current) {
+      scrollRef.current.scrollTo({
+        top: scrollRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
   }, [messages, screen]);
 
-  const activeGroup = groups.find(g => g.id === activeGroupId) || DEFAULT_GROUP;
-  const isCurrentUserAdmin = activeGroup.adminId === user.id || user.isAdmin;
-
-  // 3. Xử lý Gửi tin nhắn
+  // 3. Xử lý Gửi tin nhắn với Optimistic UI (Hiển thị ngay lập tức)
   const handleSendMessage = async (text: string, images?: string[]) => {
     if (!activeGroupId) return;
-    const msgId = Date.now().toString() + Math.random().toString(36).substr(2, 4);
+    
+    const messageId = Date.now().toString() + Math.random().toString(36).substr(2, 4);
+    const now = new Date();
+
+    // Optimistic Update: Thêm vào UI ngay lập tức trước khi gọi API
+    const optimisticMsg: Message = {
+      id: messageId,
+      sender: user,
+      text: text.trim(),
+      images: images,
+      timestamp: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isMe: true,
+      type: 'chat'
+    };
+    
+    setMessages(prev => [...prev, optimisticMsg]);
+
+    // Gửi lên Database
     const { error } = await supabase.from('messages').insert({
-      id: msgId,
+      id: messageId,
       group_id: activeGroupId,
       sender_id: user.id,
       sender_name: user.name,
       sender_avatar: user.avatar,
       text: text.trim() || null,
       images: images || [],
-      type: 'chat'
+      type: 'chat',
+      created_at: now.toISOString()
     });
-    if (error) console.error("Error sending message:", error);
+
+    if (error) {
+      console.error("Lỗi gửi tin nhắn:", error);
+      // Nếu lỗi, xóa tin nhắn tạm thời ra khỏi UI
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+    }
   };
 
-  // 4. Tham gia & Duyệt thành viên
+  // 4. Tham gia nhóm trực tiếp
   const joinWithFacebook = async () => {
     const randomProfile = FB_MOCK_PROFILES[Math.floor(Math.random() * FB_MOCK_PROFILES.length)];
-    const fbUser: User = { id: 'fb_' + Math.random().toString(36).substr(2, 5), name: randomProfile.name, avatar: randomProfile.avatar, isOnline: true, isAdmin: false };
+    const fbUser: User = { 
+      id: 'fb_' + Math.random().toString(36).substr(2, 5), 
+      name: randomProfile.name, 
+      avatar: randomProfile.avatar, 
+      isOnline: true, 
+      isAdmin: false 
+    };
+    
     sessionStorage.setItem('chat_session_user', JSON.stringify(fbUser));
     setUser(fbUser);
 
     if (activeGroupId) {
-      await supabase.from('member_requests').insert({
-        group_id: activeGroupId,
-        user_id: fbUser.id,
-        user_name: fbUser.name,
-        user_avatar: fbUser.avatar,
-        status: 'pending'
-      });
-      setIsWaitingApproval(true);
-    }
-  };
+      // Cập nhật số lượng thành viên
+      await supabase.from('groups').update({ 
+        member_count: (activeGroup.memberCount || 0) + 1 
+      }).eq('id', activeGroupId);
 
-  const approveMember = async (req: any) => {
-    const { error } = await supabase
-      .from('member_requests')
-      .update({ status: 'approved' })
-      .eq('id', req.id);
-
-    if (!error) {
-      await supabase.from('groups').update({ member_count: (activeGroup.memberCount || 0) + 1 }).eq('id', activeGroupId);
-      
-      // Gửi tin nhắn hệ thống chào mừng
+      // Thông báo hệ thống
       await supabase.from('messages').insert({
         id: 'sys_' + Date.now(),
         group_id: activeGroupId,
         sender_id: 'sys',
         sender_name: 'Hệ thống',
         sender_avatar: '',
-        text: `${req.user_name} đã gia nhập cộng đồng! 👋`,
+        text: `${fbUser.name} đã gia nhập cộng đồng! 👋`,
         type: 'system'
       });
-      
+
+      setScreen(AppScreen.CHAT);
       fetchGroups();
-      if (activeGroupId) fetchPendingRequests(activeGroupId);
     }
   };
 
@@ -188,6 +205,8 @@ const App: React.FC = () => {
     sessionStorage.setItem('chat_session_user', JSON.stringify(adminUser));
     setScreen(AppScreen.GROUP_LIST);
   };
+
+  const activeGroup = groups.find(g => g.id === activeGroupId) || DEFAULT_GROUP;
 
   const renderGroupList = () => (
     <div className="flex flex-col h-screen bg-gray-50 animate-fade-in">
@@ -204,18 +223,17 @@ const App: React.FC = () => {
       </div>
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {groups.map(group => (
-          <div key={group.id} onClick={async () => { 
+          <div key={group.id} onClick={() => { 
             setActiveGroupId(group.id); 
-            const { data } = await supabase.from('member_requests').select('status').eq('group_id', group.id).eq('user_id', user.id).single();
-            // Fix: Changed admin_id to adminId to match GroupDetails interface
-            if (data?.status === 'approved' || group.adminId === user.id || user.isAdmin) setScreen(AppScreen.CHAT);
-            else if (data?.status === 'pending') { setIsWaitingApproval(true); setScreen(AppScreen.WELCOME); }
-            else setScreen(AppScreen.WELCOME);
+            if (user.id.startsWith('guest_')) {
+              setScreen(AppScreen.WELCOME);
+            } else {
+              setScreen(AppScreen.CHAT);
+            }
           }} className="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 flex items-center space-x-4 active:bg-blue-50 cursor-pointer group">
             <img src={group.avatar} className="w-14 h-14 rounded-2xl object-cover shadow-inner" alt="" />
             <div className="flex-1">
               <h3 className="font-bold text-gray-800 group-hover:text-blue-600 transition-colors">{group.name}</h3>
-              {/* Fix: Changed member_count to memberCount to match GroupDetails interface */}
               <p className="text-xs text-gray-400 font-medium">{group.memberCount} thành viên</p>
             </div>
             <ChevronLeft className="w-5 h-5 text-gray-300 rotate-180" />
@@ -223,7 +241,7 @@ const App: React.FC = () => {
         ))}
         {groups.length === 0 && (
           <div className="text-center py-20">
-            <p className="text-gray-400 text-sm">Chưa có nhóm nào. {user.isAdmin ? 'Hãy tạo nhóm đầu tiên!' : 'Vui lòng chờ Admin tạo nhóm.'}</p>
+            <p className="text-gray-400 text-sm">Đang tải danh sách nhóm...</p>
           </div>
         )}
       </div>
@@ -235,29 +253,17 @@ const App: React.FC = () => {
       <div className="w-24 h-24 bg-white rounded-3xl shadow-2xl flex items-center justify-center mb-8 rotate-3 border-4 border-blue-100 overflow-hidden">
         <img src={activeGroup.avatar} alt="Group Icon" className="w-full h-full object-cover" />
       </div>
-      {isWaitingApproval ? (
-        <div className="animate-fade-in">
-          <h1 className="text-2xl font-bold text-white mb-2">Đã gửi yêu cầu!</h1>
-          <p className="text-blue-100 mb-8 max-w-xs">Yêu cầu của bạn đang chờ quản trị viên của <strong>{activeGroup.name}</strong> phê duyệt.</p>
-          <div className="flex justify-center space-x-1.5">
-            <div className="w-2 h-2 bg-white rounded-full animate-bounce"></div>
-            <div className="w-2 h-2 bg-white rounded-full animate-bounce [animation-delay:0.2s]"></div>
-            <div className="w-2 h-2 bg-white rounded-full animate-bounce [animation-delay:0.4s]"></div>
-          </div>
-        </div>
-      ) : (
-        <div className="w-full max-w-sm">
-          <h1 className="text-2xl font-bold text-white mb-3">Tham gia cộng đồng</h1>
-          <p className="text-blue-100 mb-8">{activeGroup.name}</p>
-          <button onClick={joinWithFacebook} className="w-full bg-white text-blue-700 py-4 px-6 rounded-2xl font-bold shadow-xl flex items-center justify-center space-x-3 active:scale-95 transition-all">
-            <FacebookIcon className="w-6 h-6" />
-            <span>Tiếp tục với Facebook</span>
-          </button>
-          {!user.isAdmin && (
-            <button onClick={loginAsAdmin} className="mt-6 text-blue-200 text-xs font-bold uppercase tracking-widest hover:text-white transition-colors">Đăng nhập quyền Admin</button>
-          )}
-        </div>
-      )}
+      <div className="w-full max-w-sm">
+        <h1 className="text-2xl font-bold text-white mb-3">Tham gia cộng đồng</h1>
+        <p className="text-blue-100 mb-8">{activeGroup.name}</p>
+        <button onClick={joinWithFacebook} className="w-full bg-white text-blue-700 py-4 px-6 rounded-2xl font-bold shadow-xl flex items-center justify-center space-x-3 active:scale-95 transition-all">
+          <FacebookIcon className="w-6 h-6" />
+          <span>Tiếp tục với Facebook</span>
+        </button>
+        {!user.isAdmin && (
+          <button onClick={loginAsAdmin} className="mt-6 text-blue-200 text-xs font-bold uppercase tracking-widest hover:text-white transition-colors">Đăng nhập quyền Admin</button>
+        )}
+      </div>
       <button onClick={() => setScreen(AppScreen.GROUP_LIST)} className="mt-8 text-blue-100 text-sm hover:underline">Quay lại trang chủ</button>
     </div>
   );
@@ -329,42 +335,28 @@ const App: React.FC = () => {
             <div className="p-8 flex flex-col items-center border-b border-gray-50">
               <img src={activeGroup.avatar} className="w-28 h-28 rounded-full border-4 border-blue-50 shadow-md object-cover mb-4" />
               <h1 className="text-xl font-bold text-gray-900">{activeGroup.name}</h1>
-              {/* Fix: Changed member_count to memberCount to match GroupDetails interface */}
               <p className="text-sm text-gray-500 font-medium">{activeGroup.memberCount} thành viên</p>
             </div>
             
-            {/* Chức năng duyệt thành viên cho Admin */}
-            {isCurrentUserAdmin && (
-              <div className="p-6 border-b border-gray-50 bg-blue-50/20">
-                <h3 className="text-xs font-bold text-blue-600 uppercase tracking-wider mb-4">Yêu cầu tham gia ({pendingRequests.length})</h3>
-                {pendingRequests.length > 0 ? (
-                  <div className="space-y-3">
-                    {pendingRequests.map(req => (
-                      <div key={req.id} className="flex items-center justify-between bg-white p-3 rounded-2xl shadow-sm border border-blue-100 animate-fade-in">
-                        <div className="flex items-center space-x-3">
-                          <img src={req.user_avatar} className="w-10 h-10 rounded-full object-cover shadow-sm" alt="" />
-                          <span className="text-sm font-bold text-gray-800 line-clamp-1">{req.user_name}</span>
-                        </div>
-                        <button 
-                          onClick={() => approveMember(req)}
-                          className="px-5 py-2 bg-blue-600 text-white text-xs font-bold rounded-xl shadow-md active:scale-95 transition-all"
-                        >
-                          Duyệt
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-xs text-gray-400 italic bg-white p-4 rounded-xl text-center border border-gray-100">Không có yêu cầu nào mới.</p>
-                )}
-              </div>
-            )}
-
             <div className="p-6">
               <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Giới thiệu</h3>
               <p className="text-gray-700 leading-relaxed text-sm bg-gray-50 p-5 rounded-2xl border border-gray-100">
                 {activeGroup.description || "Chưa có mô tả cho nhóm này."}
               </p>
+            </div>
+
+            <div className="p-6">
+               <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Quy tắc cộng đồng</h3>
+               <div className="space-y-3">
+                 {activeGroup.rules && activeGroup.rules.length > 0 ? activeGroup.rules.map((rule, i) => (
+                   <div key={i} className="flex space-x-3 text-sm text-gray-600">
+                     <span className="font-bold text-blue-600">{i + 1}.</span>
+                     <span>{rule}</span>
+                   </div>
+                 )) : (
+                    <p className="text-sm text-gray-400">Chưa có quy tắc cụ thể.</p>
+                 )}
+               </div>
             </div>
           </div>
         </div>
